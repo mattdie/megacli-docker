@@ -220,6 +220,76 @@ For issues with:
 - **MegaCLI tool**: Refer to LSI/AVAGO documentation
 - **Hardware issues**: Contact your hardware vendor
 
-## Related Images
+## Prometheus Exporter
 
-- `matthijsdiemel/smartmontools:latest` - For non-RAID controllers (AHCI, Marvell, NVMe)
+The included `megacli-exporter` script provides comprehensive metrics for Prometheus monitoring.
+
+### Features
+
+**Controller Metrics:**
+- Controller temperature
+- Controller model and firmware info
+- Memory size
+- BBU/CacheVault status
+
+**Array Metrics:**
+- Array health status (optimal/degraded)
+- Array size and RAID level
+- Per-array status tracking
+
+**Disk Metrics:**
+- Per-disk temperature
+- Media error counts
+- Other error counts
+- Predictive failure counts
+- Disk size and status
+- Rebuild progress percentage
+
+### Usage
+
+```bash
+# Run once and exit
+docker run --rm --privileged matthijsdiemel/megacli:latest \
+  python3 /path/to/megacli-exporter \
+  --gateway pushgateway.example.com:9091 \
+  --node server01 \
+  --once
+
+# Run continuously with 1-hour interval
+docker run -d --privileged \
+  -e NODE_NAME=server01 \
+  matthijsdiemel/megacli:latest \
+  python3 /path/to/megacli-exporter \
+  --gateway pushgateway.example.com:9091 \
+  --interval 1
+```
+
+### Command-Line Options
+
+```
+-g, --gateway   Pushgateway address (required)
+-i, --interval  Collection interval in hours (default: 1)
+-n, --node      Node name (default: from NODE_NAME env)
+--cli-path      Path to megacli binary (default: /usr/sbin/megacli)
+--once          Run once and exit (don't schedule)
+```
+
+### Exported Metrics
+
+```
+megacli_controller_temperature_celsius
+megacli_controller_memory_mb
+megacli_bbu_status
+megacli_goodarrays / megacli_badarrays
+megacli_gooddisks / megacli_baddisks
+megacli_array_size_gb{array_id, raid_level}
+megacli_array_status{array_id}
+megacli_disk_temperature_celsius{enclosure, slot, disk_id}
+megacli_disk_media_errors{enclosure, slot, disk_id}
+megacli_disk_other_errors{enclosure, slot, disk_id}
+megacli_disk_predictive_errors{enclosure, slot, disk_id}
+megacli_disk_size_gb{enclosure, slot, disk_id}
+megacli_disk_status{enclosure, slot, disk_id, state}
+megacli_rebuild_progress_percent{enclosure, slot}
+```
+
