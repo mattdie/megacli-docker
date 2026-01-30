@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+
+"""
+megacli-exporter extracts comprehensive information from MegaCLI and
+pushes metrics to Prometheus Pushgateway
+"""
+
+from os import path, environ
+from re import match, search
+from subprocess import Popen, PIPE
+from prometheus_client import CollectorRegistry, Gauge, Info, push_to_gateway
+from apscheduler.schedulers.blocking import BlockingScheduler
+import argparse
+
+
+class MegaCLI:
+    def __init__(self, gateway, node, cli_path='/usr/sbin/megacli'):
+        if not path.exists(cli_path):
+            raise RuntimeError(f'{cli_path} not found')
+        self.cli_path = cli_path
+        self.gateway = gateway
+        self.node = node
+        self.registry = CollectorRegistry()
+
+        # Existing metrics
+        self.baddisks = Gauge('megacli_baddisks', 'Number of bad disks', registry=self.registry)
+        self.gooddisks = Gauge('megacli_gooddisks', 'Number of good disks', registry=self.registry)
+        self.badarrays = Gauge('megacli_badarrays', 'Number of bad arrays', registry=self.registry)
+        self.goodarrays = Gauge('megacli_goodarrays', 'Number of good arrays', registry=self.registry)
+        self.temperature = Gauge('megacli_controller_temperature_celsius', 'Controller temperature in Celsius', registry=self.registry)
+
+        # New controller metrics
+        self.controller_info = Info('megacli_controller', 'Controller information', registry=self.registry)
+        self.controller_memory_mb = Gauge('megacli_controller_memory_mb', 'Controller memory in MB', registry=self.registry)
+        self.bbu_status = Gauge('megacli_bbu_status', 'BBU/CacheVault status (1=good, 0=bad)', registry=self.registry)
+
+        # New array metrics
+        self.array_size_gb = Gauge('megacli_array_size_gb', 'Array size in GB', ['array_id', 'raid_level'], registry=self.registry)
+        self.array_status = Gauge('megacli_array_status', 'Array status (1=optimal, 0=degraded)', ['array_id'], registry=self.registry)
+
+        # New per-disk metrics
+        self.disk_temperature = Gauge('megacli_disk_temperature_celsius', 'Disk temperature', ['enclosure', 'slot', 'disk_id'], registry=self.registry)
+        self.disk_media_errors = Gauge('megacli_disk_media_errors', 'Media error count', ['enclosure', 'slot', 'disk_id'], registry=self.registry)
+        self.disk_other_errors = Gauge('megacli_disk_other_errors', 'Other error count', ['enclosure', 'slot', 'disk_id'], registry=self.registry)
+        self.disk_predictive_errors = Gauge('megacli_disk_predictive_errors', 'Predictive failure count', ['enclosure', 'slot', 'disk_id'], registry=self.registry)
+        self.disk_size_gb = Gauge('megacli_disk_size_gb', 'Disk size in GB', ['enclosure', 'slot', 'disk_id'], registry=self.registry)
+        self.disk_status = Gauge('megacli_disk_status', 'Disk status (1=online, 0=offline)', ['enclosure', 'slot', 'disk_id', 'state'], registry=self.registry)
+
+        # Rebuild metrics
+        self.rebuild_progress = Gauge('megacli_rebuild_progress_percent', 'Rebuild progress percentage', ['enclosure', 'slot'], registry=self.registry)
+
+    def get_output(self, flags):
+        """Execute megacli and return parsed output"""
+        lines = []
+        try:
+            proc = Popen(f'{self.cli_path} {flags} -NoLog', shell=True, stdout=PIPE, stderr=PIPE)
+            for line in iter(proc.stdout.readline, b''):
+                if b':' in line:
+                    k, v = line.decode('UTF-8').split(':', 1)
+                    lines += [(k.strip(), v.strip())]
+            return lines
+        except Exception as err:
+            print(f'Error executing megacli: {err}')
+            return []
+
+    def get_info(self, key, input, output_format='string'):
+        """Extract information from parsed output"""
+        res = []
+        try:
+            for elem in input:
+                if match(key, elem[0]):
+                    if output_format == 'string':
+                        return elem[1]
+                    else:
+                        res.append(elem[1])
+            return res if res else ([] if output_format == 'list' else '')
+        except Exception as err:
+            print(f'Error extracting info: {err}')
+            return [] if output_format == 'list' else ''
+
+    def get_sample_value(self, key):
+        """Get value from registry"""
+        val = self.registry.get_sample_value(key)
+        return int(val) if val is not None else 0
+
+    def get_controller_info(self):
+        """Extract controller information"""
+        output = self.get_output('-AdpAllInfo -a0')
+
+        product_name = self.get_info('Product Name', output)
+        serial_number = self.get_info('Serial No', output)
+        fw_version = self.get_info('FW Package Build', output)
+
+        self.controller_info.info({
+            'product_name': product_name,
+            'serial_number': serial_number,
+            'firmware_version': fw_version
+        })
+
+        # Memory size
+        memory_str = self.get_info('Memory Size', output)
+        if memory_str:
+            memory_match = search(r'(\d+)MB', memory_str)
+            if memory_match:
+                self.controller_memory_mb.set(int(memory_match.group(1)))
+
+        # Temperature
+        temp_str = self.get_info('ROC temperature', output)
+        if temp_str:
+            temp_match = search(r'(\d+)', temp_str)
+            if temp_match:
+                self.temperature.set(int(temp_match.group(1)))
+
+    def get_bbu_status(self):
+        """Extract BBU/CacheVault status"""
+        output = self.get_output('-AdpBbuCmd -a0')
+        battery_state = self.get_info('Battery State', output)
+
+        if battery_state in ['Optimal', 'Operational']:
+            self.bbu_status.set(1)
+        else:
+            self.bbu_status.set(0)
+
+    def get_array_info(self):
+        """Extract array information"""
+        self.badarrays.set(0)
+        self.goodarrays.set(0)
+
+        # Get number of virtual drives
+        output = self.get_output('-LDInfo -Lall -a0')
+
+        array_id = 0
+        for line in output:
+            if 'Virtual Drive' in line[0]:
+                array_id = line[1].split()[0]
+
+                # Get detailed info for this array
+                ld_output = self.get_output(f'-LDInfo -L{array_id} -a0')
+
+                state = self.get_info('State', ld_output)
+                size_str = self.get_info('Size', ld_output)
+                raid_level = self.get_info('RAID Level', ld_output)
+
+                # Status
+                if state == 'Optimal':
+                    self.goodarrays.inc()
+                    self.array_status.labels(array_id=array_id).set(1)
+                else:
+                    self.badarrays.inc()
+                    self.array_status.labels(array_id=array_id).set(0)
+
+                # Size
+                if size_str:
+                    size_match = search(r'([\d.]+)\s*([TG])B', size_str)
+                    if size_match:
+                        size = float(size_match.group(1))
+                        unit = size_match.group(2)
+                        size_gb = size * 1024 if unit == 'T' else size
+                        self.array_size_gb.labels(array_id=array_id, raid_level=raid_level).set(size_gb)
+
+    def get_disk_info(self):
+        """Extract detailed disk information"""
+        self.baddisks.set(0)
+        self.gooddisks.set(0)
+
+        output = self.get_output('-LdPdInfo -a0')
+        enclosure_numbers = self.get_info('Enclosure Device ID', output, 'list')
+        slot_numbers = self.get_info('Slot Number', output, 'list')
+        disk_identifiers = [a.split()[0] for a in self.get_info('PD', output, 'list')]
+
+        slots_list = zip(enclosure_numbers, slot_numbers, disk_identifiers)
+
+        for enclosure_number, slot_id, disk_id in slots_list:
+            pd_output = self.get_output(f'-PDInfo -PhysDrv [{enclosure_number}:{slot_id}] -a0')
+
+            # Firmware state
+            state = self.get_info('Firmware state', pd_output)
+            is_online = state in ['Online', 'Online, Spun Up']
+
+            if not is_online:
+                self.baddisks.inc()
+                print(f'Bad disk detected: [{enclosure_number}:{slot_id}] - State: {state}')
+            else:
+                self.gooddisks.inc()
+
+            self.disk_status.labels(
+                enclosure=enclosure_number,
+                slot=slot_id,
+                disk_id=disk_id,
+                state=state
+            ).set(1 if is_online else 0)
+
+            # Temperature
+            temp_str = self.get_info('Drive Temperature', pd_output)
+            if temp_str:
+                temp_match = search(r'(\d+)C', temp_str)
+                if temp_match:
+                    self.disk_temperature.labels(
+                        enclosure=enclosure_number,
+                        slot=slot_id,
+                        disk_id=disk_id
+                    ).set(int(temp_match.group(1)))
+
+            # Error counts
+            media_errors = self.get_info('Media Error Count', pd_output)
+            if media_errors and media_errors.isdigit():
+                self.disk_media_errors.labels(
+                    enclosure=enclosure_number,
+                    slot=slot_id,
+                    disk_id=disk_id
+                ).set(int(media_errors))
+
+            other_errors = self.get_info('Other Error Count', pd_output)
+            if other_errors and other_errors.isdigit():
+                self.disk_other_errors.labels(
+                    enclosure=enclosure_number,
+                    slot=slot_id,
+                    disk_id=disk_id
+                ).set(int(other_errors))
+
+            pred_errors = self.get_info('Predictive Failure Count', pd_output)
+            if pred_errors and pred_errors.isdigit():
+                self.disk_predictive_errors.labels(
+                    enclosure=enclosure_number,
+                    slot=slot_id,
+                    disk_id=disk_id
+                ).set(int(pred_errors))
+
+            # Disk size
+            size_str = self.get_info('Coerced Size', pd_output)
+            if size_str:
+                size_match = search(r'([\d.]+)\s*([TG])B', size_str)
+                if size_match:
+                    size = float(size_match.group(1))
+                    unit = size_match.group(2)
+                    size_gb = size * 1024 if unit == 'T' else size
+                    self.disk_size_gb.labels(
+                        enclosure=enclosure_number,
+                        slot=slot_id,
+                        disk_id=disk_id
+                    ).set(size_gb)
+
+            # Rebuild progress
+            rebuild_str = self.get_info('Rebuild Progress', pd_output)
+            if rebuild_str and '%' in rebuild_str:
+                progress_match = search(r'(\d+)%', rebuild_str)
+                if progress_match:
+                    self.rebuild_progress.labels(
+                        enclosure=enclosure_number,
+                        slot=slot_id
+                    ).set(int(progress_match.group(1)))
+
+    def pushgateway(self):
+        """Gather all metrics and push to gateway"""
+        print(f"\n=== Collecting metrics for {self.node} ===")
+
+        self.get_controller_info()
+        self.get_bbu_status()
+        self.get_array_info()
+        self.get_disk_info()
+
+        status_line = (
+            f"Controller Temp: {self.get_sample_value('megacli_controller_temperature_celsius')}°C | "
+            f"Arrays: OK:{self.get_sample_value('megacli_goodarrays')} "
+            f"Bad:{self.get_sample_value('megacli_badarrays')} | "
+            f"Disks: OK:{self.get_sample_value('megacli_gooddisks')} "
+            f"Bad:{self.get_sample_value('megacli_baddisks')} | "
+            f"BBU: {'Good' if self.get_sample_value('megacli_bbu_status') == 1 else 'Bad'}"
+        )
+        print(status_line)
+
+        try:
+            push_to_gateway(
+                f'{self.gateway}',
+                job=f'megacli_{self.node}',
+                registry=self.registry
+            )
+            print(f"✓ Metrics pushed successfully to {self.gateway}")
+        except Exception as e:
+            print(f"✗ Failed to push metrics: {e}")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Enhanced MegaCLI Prometheus Exporter')
+    parser.add_argument('-g', '--gateway', type=str, required=True,
+                        help="Pushgateway address (e.g., pushgateway.example.com:9091)")
+    parser.add_argument('-i', '--interval', type=int, default=1,
+                        help="Collection interval in hours (default: 1)")
+    parser.add_argument('-n', '--node', type=str, default=None,
+                        help="Node name (default: from NODE_NAME env)")
+    parser.add_argument('--cli-path', type=str, default='/usr/sbin/megacli',
+                        help="Path to megacli binary (default: /usr/sbin/megacli)")
+    parser.add_argument('--once', action='store_true',
+                        help="Run once and exit (don't schedule)")
+
+    args = parser.parse_args()
+
+    # Get node name
+    node = args.node or environ.get('NODE_NAME', 'unknown')
+
+    # Print startup information
+    print("="*60)
+    print("Enhanced MegaCLI Prometheus Exporter v2.0.0")
+    print("="*60)
+    print(f"Node: {node}")
+    print(f"Pushgateway: {args.gateway}")
+    print(f"Interval: {args.interval} hour(s)")
+    print(f"MegaCLI path: {args.cli_path}")
+    print("="*60)
+
+    # Initialize and run
+    megacli = MegaCLI(args.gateway, node, args.cli_path)
+
+    if args.once:
+        # Run once and exit
+        megacli.pushgateway()
+    else:
+        # Schedule periodic execution
+        scheduler = BlockingScheduler()
+        scheduler.add_job(megacli.pushgateway, 'interval', hours=args.interval)
+
+        # Run immediately on startup
+        megacli.pushgateway()
+
+        print(f"\n✓ Scheduler started. Running every {args.interval} hour(s).")
+        print("Press Ctrl+C to stop.\n")
+
+        try:
+            scheduler.start()
+        except (KeyboardInterrupt, SystemExit):
+            print("\n✓ Exporter stopped gracefully.")
