@@ -245,35 +245,6 @@ The included `megacli-exporter` script provides comprehensive metrics for Promet
 - Disk size and status
 - Rebuild progress percentage
 
-### Usage
-
-```bash
-# Run once and exit
-docker run --rm --privileged matthijsdiemel/megacli:latest \
-  python3 /path/to/megacli-exporter \
-  --gateway pushgateway.example.com:9091 \
-  --node server01 \
-  --once
-
-# Run continuously with 1-hour interval
-docker run -d --privileged \
-  -e NODE_NAME=server01 \
-  matthijsdiemel/megacli:latest \
-  python3 /path/to/megacli-exporter \
-  --gateway pushgateway.example.com:9091 \
-  --interval 1
-```
-
-### Command-Line Options
-
-```
--g, --gateway   Pushgateway address (required)
--i, --interval  Collection interval in hours (default: 1)
--n, --node      Node name (default: from NODE_NAME env)
---cli-path      Path to megacli binary (default: /usr/sbin/megacli)
---once          Run once and exit (don't schedule)
-```
-
 ### Exported Metrics
 
 ```
